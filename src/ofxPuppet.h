@@ -28,6 +28,7 @@ public:
 	
 	ofMesh& getOriginalMesh();
 	ofMesh& getDeformedMesh();
+    
 };
 
 

@@ -2,7 +2,6 @@
 #define __RMSIMPLICIT_RIGID_MESH_DEFORMER_2D_H__
 
 
-
 #define WML_ITEM 
 #include <map>
 #include <set>
@@ -13,6 +12,10 @@
 #include "ofMain.h"
 #include "opencv2/opencv.hpp"
 
+// Test to compare whether Accelerate framework may be faster than OpenCV.  See Admsyn's tutorial:
+// http://forum.openframeworks.cc/t/a-guide-to-speeding-up-your-of-app-with-accelerate-osx-ios/10560
+#include <Accelerate/Accelerate.h>
+
 //Vertex ?
 
 namespace rmsmesh {
@@ -21,6 +24,20 @@ namespace rmsmesh {
 	class RigidMeshDeformer2D
 	{
 	public:
+        
+        /* Bryce Note : How do we know that these need to be 800.
+         * I should probably add some comments and make sure we really need 800 for the problem we are trying to solve.
+         * Golan says: for 20x20 mesh (the largest we need), the size is 796x796. Everything else is less than this. That's why.
+         */
+        static float A [800*800];
+        static float S [800];
+        static float U [800*800];
+        static float VT[800*800];
+        static __CLPK_integer ipiv[800];
+        
+        static Wml::GMatrixd mGPrimeInverse;
+        
+        
 		RigidMeshDeformer2D( );
 		~RigidMeshDeformer2D() {};
 		
@@ -52,6 +69,9 @@ namespace rmsmesh {
 		/*
 		 * debug
 		 */
+        
+
+        
 	
     protected:
 		
@@ -99,7 +119,9 @@ namespace rmsmesh {
 		
 		
 		bool m_bSetupValid;
-		void InvalidateSetup() { m_bSetupValid = false; }
+		void InvalidateSetup() {
+            m_bSetupValid = false;
+        }
 		void ValidateSetup();
 		
 		
@@ -121,6 +143,29 @@ namespace rmsmesh {
 		
 		ofVec2f GetInitialVert( unsigned int nVert ) 
 		{ return ofVec2f( m_vInitialVerts[ nVert ].vPosition.x, m_vInitialVerts[ nVert ].vPosition.y ); }
+        
+    public:
+        
+        
+        /* Bryce functions */
+        
+        // Computes least squares solution matrix for any right hand side b.
+		void lapackSVD(cv::Mat wmatrix, cv::SVD * output);
+        
+        // Transforms a double prescision array into a single prescision array.
+		inline void static copyDoubleToFloat(double * in, float * out, int len);
+        
+		// Transforms a single prescision array into a double prescision array.
+		inline void static copyFloatToDouble(float * in, double * out, int len);
+        
+		// Sets a block of memory to the identity.
+		inline void static setToIdentity(float * mat, int size);
+        
+		// Requires a float array that will be transposed and mapped to the given destenation matrix.
+		void inline copyMatSpecial(float *, cv::Mat * dest);
+        
+        inline double sqd (double d){ return d*d; }
+        
 	};
 	
 	

@@ -4,6 +4,10 @@
 #include <WmlMatrix4.h>
 #include "WmlExtTriangleUtils.h"
 #include "rmsdebug.h"
+#include <Accelerate/Accelerate.h>
+#include <stdio.h>
+#include <string.h>
+
 
 using namespace rmsmesh;
 
@@ -15,13 +19,138 @@ cv::Mat toCv(Wml::GMatrixd& gmat) {
 	return cv::Mat(gmat.GetRows(), gmat.GetColumns(), CV_64FC1, (double*) gmat);
 }
 
+// Rigid Mesh Deformation Local memory buffers.
+float RigidMeshDeformer2D::A [800*800];
+float RigidMeshDeformer2D::U [800*800];
+float RigidMeshDeformer2D::S [800];
+float RigidMeshDeformer2D::VT[800*800];
+__CLPK_integer RigidMeshDeformer2D::ipiv[800];
+
+
+// Matrix invert using Accelerate
 void invert(Wml::GMatrixd& from, Wml::GMatrixd& to) {
-	cout << "inverting " << from.GetRows() << " x " << from.GetColumns() << endl;
-	cv::Mat fromMat = toCv(from), toMat = toCv(to);
-	cv::invert(fromMat, toMat, cv::DECOMP_LU); // LU is 3x as fast as CHOLESKY
-	cout << "inverted" << endl;
+    
+    if (from.GetRows() > 50){
+        cout << "inverting " << from.GetRows() << " x " << from.GetColumns() << endl;
+    }
+    //size_t time_start, time_end;
+    //time_start = ofGetElapsedTimeMicros();
+    
+    int rows = from.GetRows();
+    int cols = from.GetColumns();
+    int len  = rows*cols;
+
+    // Note that although we are converting from column major to row major ordering and back,
+    // it should not matter, because the A^{-1} = ((A^{T})^{-1})
+    
+    RigidMeshDeformer2D::copyDoubleToFloat((double*) from, RigidMeshDeformer2D::A, len);
+    RigidMeshDeformer2D::setToIdentity(RigidMeshDeformer2D::U, rows);
+    
+    // perform the [s]ingle precision [ge]eneral Matrix [s]ol[v]e (sgesv)
+    // CULA call: sgesv_ (rows, rows, RigidMeshDeformer2D::A, rows, i, RigidMeshDeformer2D::U, rows);
+    __CLPK_integer clpk_rows = rows;
+    __CLPK_integer clpk_lda  = rows;
+    __CLPK_integer clpk_ldb  = rows;
+    __CLPK_integer clpk_nrhs = rows;
+    __CLPK_integer info;
+    
+    sgesv_ (&clpk_rows,
+            &clpk_nrhs,
+            RigidMeshDeformer2D::A,
+            &clpk_lda,
+            RigidMeshDeformer2D::ipiv,
+            RigidMeshDeformer2D::U,
+            &clpk_ldb,
+            &info);
+
+    RigidMeshDeformer2D::copyFloatToDouble(RigidMeshDeformer2D::U, (double *) to, len);
+
+    //time_end = ofGetElapsedTimeMicros();
+    //cout << "inverted. elapsed time = " << time_end - time_start  << endl;
 }
-	
+
+// REQUIRES : A must be a square matrix.
+// ENSURES  : Computes A + Transpose(A) and stores the result in A.
+// FIXME : Do a more formal analysis of Cache hits in terms of this algorithm.
+void addToTranspose(Wml::GMatrixd& A)
+{
+    // Extract and check dimensions.
+    int nRows = A.GetRows();
+	int nCols = A.GetColumns();
+    
+    /*
+    if(nRows != nCols)
+    {
+        cout << "Error in addToTranspose(), input matrix is not square.";
+        Debugbreak();
+    }
+     */
+    
+    // Compute Diagonals first.
+    for(int i = 0; i < nRows; i++)
+    {
+        A[i][i] = A[i][i]*2;
+    }
+    
+    // Compute upper triangular and lower triangular elements.
+    for(int r = 0; r < nRows; r++)
+    for(int c = r + 1; c < nCols; c++)
+    {
+        double result = A[r][c] + A[c][r];
+        A[r][c] = result;
+        A[c][r] = result;
+    }
+}
+
+inline void RigidMeshDeformer2D::copyDoubleToFloat (double * in, float * out, int len){
+    for (int i = 0; i < len; i++){
+        out[i] = (float)in[i];
+    }
+}
+
+inline void RigidMeshDeformer2D::copyFloatToDouble (float * in, double * out, int len){
+    for (int i = 0; i < len; i++){
+        out[i] = (double)in[i];
+    }
+}
+
+inline void RigidMeshDeformer2D::setToIdentity (float * mat, int size){
+    int index = 0;
+    for(int r = 0; r < size; r++){
+        for(int c = 0; c < size; c++){
+            
+            if(r == c){
+                mat[index] = 1;
+            } else {
+                mat[index] = 0;
+            }
+            index++;
+        }
+    }
+}
+
+// Matrix invert using OpenCV
+void invertWithOpenCV (Wml::GMatrixd& from, Wml::GMatrixd& to) {
+	cout << "OpenCV Matrix inversion " << from.GetRows() << " x " << from.GetColumns() << endl;
+    int then = (int) ofGetElapsedTimeMicros();
+	cv::Mat fromMat = toCv(from), toMat = toCv(to);
+	cv::invert (fromMat, toMat, cv::DECOMP_LU); // LU is 3x as fast as CHOLESKY
+    int now = (int) ofGetElapsedTimeMicros();
+    printf("Matrix inversion done; took %d\n", (now-then));
+
+}
+
+// Not Tested.
+void transposeWithOpenCV (Wml::GMatrixd& from, Wml::GMatrixd& to)
+{
+	cout << "OpenCV Matrix transpose" << from.GetRows() << " x " << from.GetColumns() << endl;
+    int then = (int) ofGetElapsedTimeMicros();
+	cv::Mat fromMat = toCv(from), toMat = toCv(to);
+	cv::transpose(fromMat, toMat);
+    int now = (int) ofGetElapsedTimeMicros();
+    printf("Matrix transposition done; took %d\n", (now-then));
+}
+
 RigidMeshDeformer2D::RigidMeshDeformer2D()
 {
 	InvalidateSetup();
@@ -57,8 +186,8 @@ void RigidMeshDeformer2D::RemoveHandle( unsigned int nHandle )
      float fM00 = kV02.dot(kV02);
      float fM01 = kV02.dot(kV12);
      float fM11 = kV12.dot(kV12);
-     float fR0 = kV02.dot(kPV2);
-     float fR1 = kV12.dot(kPV2);
+     float fR0  = kV02.dot(kPV2);
+     float fR1  = kV12.dot(kPV2);
      float fDet = fM00*fM11 - fM01*fM01;
      //    ASSERT( Wml::Math<Real>::FAbs(fDet) > (Real)0.0 );
      float fInvDet = ((float)1.0)/fDet;
@@ -91,7 +220,6 @@ void RigidMeshDeformer2D::UnTransformPoint( ofVec2f & vTransform )
 		vTransform = fBary1 * v1Init + fBary2 * v2Init + fBary3 * v3Init;
 		return;
 	}
-	
 }
 
 
@@ -101,13 +229,11 @@ void RigidMeshDeformer2D::InitializeFromMesh( ofMesh * pMesh )
 	m_vInitialVerts.resize(0);
 	m_vDeformedVerts.resize(0);
 	m_vTriangles.resize(0);
-	
+    
 	// copy vertices
 	unsigned int nVerts = pMesh->getVertices().size();
 	for ( unsigned int i = 0; i < nVerts; ++i ) {
-		//Wml::Vector3f vVertex;
-		
-
+		// Wml::Vector3f vVertex;
         // TODO THIS IS OK?
         ofVec3f vVertex = pMesh->getVertices()[i];
         
@@ -117,6 +243,8 @@ void RigidMeshDeformer2D::InitializeFromMesh( ofMesh * pMesh )
 		m_vDeformedVerts.push_back( v );
 	}
 	
+    //printf ("nVerts = pMesh->getVertices().size() = %d\n", nVerts);
+    //printf ("m_vInitialVerts.size() = %d\n", m_vInitialVerts.size());
     
     // TODO here?
     
@@ -126,7 +254,6 @@ void RigidMeshDeformer2D::InitializeFromMesh( ofMesh * pMesh )
 	for ( unsigned int i = 0; i < nTris; ++i ) {
 		Triangle t;
         
-        
         t.vTriCoords[0].set( pMesh->getVertices()[ pMesh->getIndices()[i*3]]);
         t.vTriCoords[1].set( pMesh->getVertices()[ pMesh->getIndices()[i*3+1]]);
         t.vTriCoords[2].set( pMesh->getVertices()[ pMesh->getIndices()[i*3+2]]);
@@ -134,7 +261,6 @@ void RigidMeshDeformer2D::InitializeFromMesh( ofMesh * pMesh )
         t.nVerts[0] = pMesh->getIndices()[i*3];
         t.nVerts[1] = pMesh->getIndices()[i*3+1];
         t.nVerts[2] = pMesh->getIndices()[i*3+2];
-        
         
 		//pMesh->GetTriangle(i, t.nVerts );
 		m_vTriangles.push_back(t);
@@ -150,13 +276,9 @@ void RigidMeshDeformer2D::InitializeFromMesh( ofMesh * pMesh )
 			unsigned int n1 = (j+1)%3;
 			unsigned int n2 = (j+2)%3;
 			
-			
-			
-			
 			ofPoint v0 = (GetInitialVert( t.nVerts[n0] ));
 			ofPoint v1 = (GetInitialVert( t.nVerts[n1] ));
 			ofPoint v2 = (GetInitialVert( t.nVerts[n2] ));
-			
 			
 			// find coordinate system
 			ofPoint v01( v1 - v0 );
@@ -168,8 +290,6 @@ void RigidMeshDeformer2D::InitializeFromMesh( ofMesh * pMesh )
 			ofPoint vLocal(v2 - v0);
 			float fX = vLocal.dot(v01) /  v01.lengthSquared();
 			float fY = vLocal.dot(v01Rot90) / v01Rot90.lengthSquared();
-			
-			
 			
 			// sanity check
 			ofPoint v2test(v0 + fX * v01 + fY * v01Rot90);
@@ -233,9 +353,6 @@ void RigidMeshDeformer2D::InitializeFromMesh( ofMesh * pMesh )
 void RigidMeshDeformer2D::UpdateDeformedMesh( ofMesh * pMesh, bool bRigid )
 {
 	ValidateDeformedMesh(bRigid);
-	
-
-    
 	std::vector<Vertex> & vVerts = (m_vConstraints.size() > 1) ? m_vDeformedVerts : m_vInitialVerts;
 	
 	unsigned int nVerts = pMesh->getVertices().size();
@@ -266,15 +383,11 @@ void RigidMeshDeformer2D::UpdateConstraint( Constraint & cons )
 		
 		m_vConstraints.erase(found);
 		m_vConstraints.insert(copy);
-		
-		
 		m_vDeformedVerts[cons.nVertex].vPosition = cons.vConstrainedPos;
 		
 	} else {
         
         //printf("adding constraint ! \n");
-		
-        
 		m_vConstraints.insert( cons );
 		m_vDeformedVerts[cons.nVertex].vPosition = cons.vConstrainedPos;
 		InvalidateSetup();
@@ -284,16 +397,21 @@ void RigidMeshDeformer2D::UpdateConstraint( Constraint & cons )
 
 
 
-
-void ExtractSubMatrix( Wml::GMatrixd & mFrom, int nRowOffset, int nColOffset, Wml::GMatrixd & mTo )
+/* REQUIRES :   source must be a well formed reference to a Wild magic double matrix.
+ *              dest must also be a well formed reference to a Wild magic double matrix.
+ *            nRowOffset and nColOffset specify where the destination matrix will be extracted from the source matrix.
+ *
+ * WARNING : The matrices must be defined in row major order, or else the memcpy() function calls will be erroneous.
+ */
+void ExtractSubMatrix( Wml::GMatrixd & source, int nRowOffset, int nColOffset, Wml::GMatrixd & dest)
 {
-	int nRows = mTo.GetRows();
-	int nCols = mTo.GetColumns();
+	int nRows = dest.GetRows();
+	int nCols = dest.GetColumns();
 	
-	for ( int i = 0; i < nRows; ++i ) {
-		for ( int j = 0; j < nCols; ++j ) {
-			mTo[i][j] = mFrom[ i + nRowOffset][ j + nColOffset ];
-		}
+    // Using memcpy to make the copying faster.
+	for ( int i = 0; i < nRows; ++i )
+    {
+        std::memcpy(&dest[i][0], &source[i + nRowOffset][nColOffset], nCols*sizeof(double));
 	}
 }
 
@@ -303,19 +421,37 @@ void RigidMeshDeformer2D::ValidateSetup()
 	if  ( m_bSetupValid || m_vConstraints.size() < 2)
 		return;
 	
+    long then, now;
+    int nInitialVerts = (int) m_vInitialVerts.size();
 	
-	//printf("Computing matrices for mesh with %i verts....this might take a while...\n", m_vInitialVerts.size() );
-	
-	PrecomputeOrientationMatrix();
-	
-	// ok, now scale triangles
-	size_t nTris = m_vTriangles.size();
-	for ( unsigned int i = 0; i < nTris; ++i )
+    printf("------------------------\n");
+    printf("Mesh has %i verts.\n", (int) m_vInitialVerts.size() );
+    int elapsed = 0;
+    
+    then = ofGetElapsedTimeMicros();
+    PrecomputeOrientationMatrix();
+    now = ofGetElapsedTimeMicros();
+    elapsed += (int)(now-then);
+    printf("PrecomputeOrientationMatrix() took %d\n", (int)(now-then));
+    
+    then = ofGetElapsedTimeMicros();
+	size_t nTris = m_vTriangles.size(); // now scale triangles
+	for ( unsigned int i = 0; i < nTris; ++i ){
 		PrecomputeScalingMatrices(i);
-	
+	}
+    now = ofGetElapsedTimeMicros();
+    elapsed += (int)(now-then);
+    printf("PrecomputeScalingMatrices() took %d\n", (int)(now-then));
+    
+    then = ofGetElapsedTimeMicros();
 	PrecomputeFittingMatrices();
+    now = ofGetElapsedTimeMicros();
+    elapsed += (int)(now-then);
+    
+    printf("PrecomputeFittingMatrices() (SVD) took %d\n", (int)(now-then));
+    printf("TOTAL = %d\n", elapsed);
+
 	
-	//printf("Done!\n" );
 	
 	
 	m_bSetupValid = true;
@@ -326,6 +462,11 @@ void RigidMeshDeformer2D::ValidateSetup()
 
 void RigidMeshDeformer2D::PrecomputeFittingMatrices()
 {
+    // Time testing apparatus.
+    size_t t_start, t_end, t_mid;
+    t_start = ofGetElapsedTimeMicros();
+    t_mid = t_start;
+    
 	// put constraints into vector (will be useful)
 	std::vector<Constraint> vConstraintsVec;
 	std::set<Constraint>::iterator cur(m_vConstraints.begin()), end(m_vConstraints.end());
@@ -351,111 +492,249 @@ void RigidMeshDeformer2D::PrecomputeFittingMatrices()
 		m_vVertexMap[vConstraintsVec[i].nVertex ] = nRow++;
 	if ( nRow != nVerts )	Debugbreak();		// bad!
 	
-	
-	// test vector...
-	Wml::GVectord gUTestX( nVerts ), gUTestY(nVerts);
-	for ( unsigned int i = 0; i < nVerts; ++i ) {
-		Constraint c(i,ofVec2f(0,0));
-		if ( m_vConstraints.find(c) != m_vConstraints.end() )
-			continue;
-		int nRow = m_vVertexMap[i];
-		gUTestX[nRow] = m_vInitialVerts[i].vPosition.x;
-		gUTestY[nRow] = m_vInitialVerts[i].vPosition.y;
-	}
-	for ( unsigned int i = 0; i < nConstraints; ++i ) {
-		int nRow = m_vVertexMap[ vConstraintsVec[i].nVertex ];
-		gUTestX[nRow] = vConstraintsVec[i].vConstrainedPos.x;
-		gUTestY[nRow] = vConstraintsVec[i].vConstrainedPos.y;
-	}
-	
-	
+    t_end = ofGetElapsedTimeMicros();
+    cout << " Fitting Computations (1) " << (t_end - t_mid) << endl;
+	t_mid = t_end;
+    
+    //------------------------
 	// make Hy and Hx matrices
+    /*
+     *
+     * One of these statements must go.
+     *
+     */
+    // Golan Comment: Note: simply allocating these arrays takes close to a millisecond.
+    // since nVerts is not changing from frame-to-frame,
+    // allocate them in InitializeFromMesh()!
 	Wml::GMatrixd mHX( nVerts, nVerts );
 	Wml::GMatrixd mHY( nVerts, nVerts );
+    
+    // Golan Comment: Almost 3 milliseconds could be saved by using a memzero() here:
 	for ( unsigned int i = 0; i < nVerts; ++i )
 		for ( unsigned int j = 0; j < nVerts; ++j )
 			mHX(i,j) = mHY(i,j) = 0.0;
-	
-	// ok, now fill matrix
+    
+	// Now populate matrix
+    unsigned int *tnVerts;
+    unsigned int VtnVerts0, VtnVerts1, VtnVerts2;
 	size_t nTriangles = m_vTriangles.size();
+    int time0 = (int)ofGetElapsedTimeMicros();
 	for ( unsigned int i = 0; i < nTriangles; ++i ) {
-		Triangle & t = m_vTriangles[i];
+        tnVerts = (m_vTriangles[i]).nVerts;
 		
-		//		_RMSInfo("Triangle %d: \n", i);
-		double fTriSumErr = 0;
-		for ( int j = 0; j < 3; ++j ) {
-			double fTriErr = 0;
-			
-			int nA = m_vVertexMap[ t.nVerts[j] ];
-			int nB = m_vVertexMap[ t.nVerts[(j+1)%3] ];
-			
-			// X elems
-			mHX[nA][nA] += 2;
-			mHX[nA][nB] += -2;
-			mHX[nB][nA] += -2;
-			mHX[nB][nB] += 2;
-			
-			//  Y elems
-			mHY[nA][nA] += 2;
-			mHY[nA][nB] += -2;
-			mHY[nB][nA] += -2;
-			mHY[nB][nB] += 2;			
-		}
+        VtnVerts0 = m_vVertexMap[ tnVerts[0] ];
+        VtnVerts1 = m_vVertexMap[ tnVerts[1] ];
+        VtnVerts2 = m_vVertexMap[ tnVerts[2] ];
+        
+        mHX[VtnVerts0][VtnVerts0] +=  4;
+        mHX[VtnVerts0][VtnVerts1] += -2;
+        mHX[VtnVerts0][VtnVerts2] += -2;
+        mHX[VtnVerts1][VtnVerts0] += -2;
+        mHX[VtnVerts1][VtnVerts1] +=  4;
+        mHX[VtnVerts1][VtnVerts2] += -2;
+        mHX[VtnVerts2][VtnVerts0] += -2;
+        mHX[VtnVerts2][VtnVerts1] += -2;
+        mHX[VtnVerts2][VtnVerts2] +=  4;
+        
+        mHY[VtnVerts0][VtnVerts0] +=  4;
+        mHY[VtnVerts0][VtnVerts1] += -2;
+        mHY[VtnVerts0][VtnVerts2] += -2;
+        mHY[VtnVerts1][VtnVerts0] += -2;
+        mHY[VtnVerts1][VtnVerts1] +=  4;
+        mHY[VtnVerts1][VtnVerts2] += -2;
+        mHY[VtnVerts2][VtnVerts0] += -2;
+        mHY[VtnVerts2][VtnVerts1] += -2;
+        mHY[VtnVerts2][VtnVerts2] +=  4;
 	}
+
 	
+    t_end = ofGetElapsedTimeMicros();
+    cout << " Fitting Computations (2) " << (t_end - t_mid) << endl;
+    t_mid = t_end;
+    
 	// extract HX00 and  HY00 matrices
 	Wml::GMatrixd mHX00( (int)nFreeVerts, (int)nFreeVerts );
 	Wml::GMatrixd mHY00( (int)nFreeVerts, (int)nFreeVerts );
 	ExtractSubMatrix( mHX, 0, 0, mHX00 );
 	ExtractSubMatrix( mHY, 0, 0, mHY00 );
-	
+
+    t_end = ofGetElapsedTimeMicros();
+    cout << " Fitting Computations (2.5) " << (t_end - t_mid) << endl;
+    t_mid = t_end;
+    
 	// Extract HX01 and HX10 matrices
 	Wml::GMatrixd mHX01( (int)nFreeVerts, (int)nConstraints );
-	Wml::GMatrixd mHX10( (int)nConstraints, (int)nFreeVerts );
+	//Wml::GMatrixd mHX10( (int)nConstraints, (int)nFreeVerts );
 	ExtractSubMatrix( mHX, 0, nFreeVerts, mHX01 );
-	ExtractSubMatrix( mHX, nFreeVerts, 0, mHX10 );
+	//ExtractSubMatrix( mHX, nFreeVerts, 0, mHX10 );
 	
 	// Extract HY01 and HY10 matrices
 	Wml::GMatrixd mHY01( (int)nFreeVerts, (int)nConstraints );
-	Wml::GMatrixd mHY10( (int)nConstraints, (int)nFreeVerts );
+	//Wml::GMatrixd mHY10( (int)nConstraints, (int)nFreeVerts );
 	ExtractSubMatrix( mHY, 0, nFreeVerts, mHY01 );
-	ExtractSubMatrix( mHY, nFreeVerts, 0, mHY10 );
+	//ExtractSubMatrix( mHY, nFreeVerts, 0, mHY10 );
 	
 	// now compute HXPrime = HX00 + Transpose(HX00) (and HYPrime)
-	//Wml::GMatrixd mHXPrime( mHX00 + mHX00.Transpose() );
-	//Wml::GMatrixd mHYPrime( mHY00 + mHY00.Transpose() );
 	m_mHXPrime = mHX00;
 	m_mHYPrime = mHY00;
 	
 	// and then D = HX01 + Transpose(HX10)
-	//Wml::GMatrixd mDX = mHX01 + mHX10.Transpose();
-	//Wml::GMatrixd mDY = mHY01 + mHY10.Transpose();
 	m_mDX = mHX01;
 	m_mDY = mHY01;
 	
-	
-	// pre-compute LU decompositions
-	/*
-	bool bResult = Wml::LinearSystemExtd::LUDecompose( m_mHXPrime, m_mLUDecompX );
-	if (!bResult)
-		DebugBreak();
-	bResult = Wml::LinearSystemExtd::LUDecompose( m_mHYPrime, m_mLUDecompY );
-	if (!bResult)
-		DebugBreak();
-	 */
-	
-	cout << "SVD decomposition" << endl;
-	m_mSVDDecompX(toCv(m_mHXPrime));
+    t_end = ofGetElapsedTimeMicros();
+    cout << " Fitting Computations (3) " << (t_end - t_mid) << endl;
+    t_mid = t_end;
+    
+	// Pre-compute LU decompositions.
+    // Old, for reference only, Using WML
+    // bool bResult = Wml::LinearSystemExtd::LUDecompose( m_mHXPrime, m_mLUDecompX );
+    // if (!bResult){
+    //     Debugbreak();
+    // }
+    // bResult = Wml::LinearSystemExtd::LUDecompose( m_mHYPrime, m_mLUDecompY );
+    // if (!bResult){
+    //     Debugbreak();
+    // }
+    
+    t_end = ofGetElapsedTimeMicros();
+    cout << " Fitting Computations (ALL) " << (t_end - t_start) << endl;
+
+    
+    bool bPrintElapsed = true;
+    size_t time_start, time_end;
+    if (bPrintElapsed){
+        cout << "  SVD decomposition ..." << endl;
+        time_start = ofGetElapsedTimeMicros();
+    }
+    
+#ifdef TARGET_OSX
+    // Use the Accelerate framework to perform SVD.
+    lapackSVD (toCv(m_mHXPrime), &m_mSVDDecompX);
+	lapackSVD (toCv(m_mHYPrime), &m_mSVDDecompY);
+#else
+    // Use OpenCV to perform SVD.
+    m_mSVDDecompX(toCv(m_mHXPrime));
 	m_mSVDDecompY(toCv(m_mHYPrime));
-	cout << "done decomposing" << endl;
+#endif
+    
+    if (bPrintElapsed){
+        time_end = ofGetElapsedTimeMicros();
+        cout << "  SVD Decomposition : " << (time_end - time_start) << endl;
+    }
+
 }
 
 
-void RigidMeshDeformer2D::ApplyFittingStep()
-{
+
+
+// Computes least squares solution matrix for any right hand side b.
+// Should work for square matrices.
+void RigidMeshDeformer2D::lapackSVD(cv::Mat wmatrix, cv::SVD * output) {
+    
+    size_t t_start, t_end;
+    
+    t_start = ofGetElapsedTimeMicros();
+    
+#ifdef TARGET_OSX
+	/* Declare all the necessary variables */
+    
+	/* Dimensions of matrices */
+	int rows    = wmatrix.rows;
+	int columns = wmatrix.cols;
+	int len     = rows*columns;
+
+	/* Memory allocation failed */
+    if(!A || !S || !U || !VT) {
+        free(A);
+        free(U);
+        free(S);
+        free(VT);
+        return;
+    }
 	
+	// Populate the initial matrix with the input matrix data.
+	for (int r = 0; r < rows; r++){
+        for (int c = 0; c < columns; c++){
+            int index = c*columns + r;
+            float temp = (float)(wmatrix.at<double>(r, c));
+            A[index] = temp;
+        }
+    }
+    
+    t_end = ofGetElapsedTimeMicros();
+    cout << "  Float Copying Time (SVD): " << (t_end - t_start) << endl;
+    
+    /* Setup SVD Parameters */
+    __CLPK_integer M       = rows;
+    __CLPK_integer N       = columns;
+    __CLPK_integer LDA     = M;
+    __CLPK_integer LDU     = M;
+    __CLPK_integer LDVT    = N;
+    
+    int nSVs = M > N ? N : M;
+    float workSize;
+    __CLPK_integer lwork = -1;
+    __CLPK_integer info = 0;
+    
+    // iwork dimension should be at least 8*min(m,n)
+    __CLPK_integer iwork[8*nSVs];
+    
+    // See https://github.com/pkmital/pkmMatrix/blob/master/pkmMatrix.h
+    // https://groups.google.com/forum/#!topic/julia-dev/mmgO65i6-fA sdd
+    // (divide/conquer, better if memory is available, for large matrices) versus svd (qr)
+    // http://docs.oracle.com/cd/E19422-01/819-3691/dgesvd.html
+    
+    // call svd to query optimal work size:
+    char job = 'A';
+    sgesdd_(&job, &M, &N, A, &LDA, S, U, &LDU, VT, &LDVT, &workSize, &lwork, iwork, &info);
+    
+    lwork = (int)workSize;
+    float work[lwork];
+    
+    /* Perform actual singular value decomposition */
+    sgesdd_ (&job, &M, &N, A, &LDA, S, U, &LDU, VT, &LDVT, work, &lwork, iwork, &info);
+    
+	// Check for convergence
+    if ( info > 0 ) {
+        printf( "sgesdd_() failed to converge.\\n" );
+    }
+    
+	// Double prescision resizing.
+	output -> u.create(rows, rows, CV_64F);
+	output -> w.create(1, columns, CV_64F);
+	output -> vt.create(columns, columns, CV_64F);
+    
+	// Populate the openCV output structure.
+	copyMatSpecial(U,  &(output -> u));
+	copyMatSpecial(VT, &(output -> vt));
+	copyMatSpecial(S,  &(output -> w));
 	
-	
+#else
+    ;
+    
+#endif
+    
+	return;
+}
+
+
+// Requires a float array that will be transposed and mapped to the given destenation matrix.
+inline void RigidMeshDeformer2D::copyMatSpecial(float * A, cv::Mat * dest) {
+	int rows = dest -> rows;
+	int cols = dest -> cols;
+    
+	for (int r = 0; r < rows; r++){
+        for (int c = 0; c < cols; c++){
+            int i1 = c*rows + r;
+            dest->at<double>(r, c) = A[i1];
+        }
+    }
+}
+
+
+
+void RigidMeshDeformer2D::ApplyFittingStep() {
 	
 	// put constraints into vector (will be useful)
 	std::vector<Constraint> vConstraintsVec;
@@ -560,68 +839,86 @@ void RigidMeshDeformer2D::ApplyFittingStep()
 
 
 
-
-
-
-
-
-
-
-
-
 void RigidMeshDeformer2D::PrecomputeOrientationMatrix()
 {
+    // Time testing apparatus.
+    size_t t_start, t_end, t_mid;
+    t_start = ofGetElapsedTimeMicros();
+    t_mid   = t_start;
+    
+    /*
+     *
+     * Bryce note: Think about allocating these pieces of memory statically instead of each time.
+     *
+     */
+    
 	// put constraints into vector (will be useful)
-	std::vector<Constraint> vConstraintsVec;
-	std::set<Constraint>::iterator cur(m_vConstraints.begin()), end(m_vConstraints.end());
-	while ( cur != end )
-		vConstraintsVec.push_back( *cur++ );
-	
+	std::set<Constraint>::iterator cur(m_vConstraints.begin()),
+                                   end(m_vConstraints.end());
+    std::vector<Constraint> vConstraintsVec(cur, end);
+    // Bryce Note: we can construct the vector using this constructor, instead of manually iterating to construct the vector.
+    
 	// resize matrix and clear to zero
 	unsigned int nVerts = (unsigned int)m_vDeformedVerts.size();
-	m_mFirstMatrix.SetSize( 2*nVerts, 2*nVerts);
-	for ( unsigned int i = 0; i < 2*nVerts; ++i )
-		for ( unsigned int j = 0; j < 2*nVerts; ++j )
-			m_mFirstMatrix(i,j) = 0.0;
+    unsigned int nVerts2 = nVerts*2;
+	m_mFirstMatrix.SetSize( nVerts2, nVerts2);
+    // Bryce Note: The implementation of SetSize automatically clears the matrix to 0.
+
 	
 	size_t nConstraints = vConstraintsVec.size();
 	unsigned int nFreeVerts = nVerts - nConstraints;
 	
-	// figure out vertex ordering. first do free vertices, then constraints
+	// figure out vertex ordering. first do constraints, then do free vertices.
 	unsigned int nRow = 0;
 	m_vVertexMap.resize(nVerts);
-	for ( unsigned int i = 0; i < nVerts; ++i ) {
-		Constraint c(i, ofVec2f(0,0));
-		if ( m_vConstraints.find(c) != m_vConstraints.end() )
-			continue;
-		m_vVertexMap[i] = nRow++;
+    ofVec2f zeroVector(0,0);
+	for ( unsigned int i = 0; i < nVerts; ++i )
+    {
+		Constraint c(i, zeroVector);
+        
+        // Bryce Note : Conditional Branch optimized.
+		if ( m_vConstraints.find(c) == m_vConstraints.end() )
+		{
+            m_vVertexMap[i] = nRow++;
+        }
 	}
-	if ( nRow != nFreeVerts )	Debugbreak();
+    
+	if ( nRow != nFreeVerts ){Debugbreak();}
 	for ( unsigned int i = 0 ; i < nConstraints; ++i )
+    {
 		m_vVertexMap[vConstraintsVec[i].nVertex ] = nRow++;
+    }
 	if ( nRow != nVerts )	Debugbreak();		// bad!
 	
+    t_end = ofGetElapsedTimeMicros();
+    cout << " Orientation Computations (1) " << (t_end - t_mid) << endl;
+	t_mid = t_end;
 	
 	// test vector...
 	Wml::GVectord gUTest( nVerts * 2 );
 	for ( unsigned int i = 0; i < nVerts; ++i ) {
 		Constraint c(i,ofVec2f(0,0));
-		if ( m_vConstraints.find(c) != m_vConstraints.end() )
-			continue;
-		int nRow = m_vVertexMap[i];
-		gUTest[2*nRow] = m_vInitialVerts[i].vPosition.x;
-		gUTest[2*nRow+1] = m_vInitialVerts[i].vPosition.y;
+		if ( m_vConstraints.find(c) == m_vConstraints.end() )
+        {
+            int nRow = m_vVertexMap[i];
+            gUTest[2*nRow] = m_vInitialVerts[i].vPosition.x;
+            gUTest[2*nRow+1] = m_vInitialVerts[i].vPosition.y;
+        }
 	}
 	for ( unsigned int i = 0; i < nConstraints; ++i ) {
 		int nRow = m_vVertexMap[ vConstraintsVec[i].nVertex ];
 		gUTest[2*nRow] = vConstraintsVec[i].vConstrainedPos.x;
 		gUTest[2*nRow+1] = vConstraintsVec[i].vConstrainedPos.y;
 	}
-	
+    
+    t_end = ofGetElapsedTimeMicros();
+    cout << " Orientation Computations (2) " << (t_end - t_mid) << endl;
+	t_mid = t_end;
 	
 	// ok, now fill matrix (?)
 	size_t nTriangles = m_vTriangles.size();
-	for ( unsigned int i = 0; i < nTriangles; ++i ) {
+	for ( unsigned int i = 0; i < nTriangles; ++i )
+    {
 		Triangle & t = m_vTriangles[i];
 		
 		//printf("Triangle %i: \n", i);
@@ -629,7 +926,7 @@ void RigidMeshDeformer2D::PrecomputeOrientationMatrix()
 		for ( int j = 0; j < 3; ++j ) {
 			double fTriErr = 0;
 			
-			int n0x = 2 * m_vVertexMap[ t.nVerts[j] ];
+			int n0x = 2 * m_vVertexMap[ t.nVerts[(j  )  ] ];
 			int n0y = n0x + 1;
 			int n1x = 2 * m_vVertexMap[ t.nVerts[(j+1)%3] ];
 			int n1y = n1x + 1;
@@ -637,74 +934,58 @@ void RigidMeshDeformer2D::PrecomputeOrientationMatrix()
 			int n2y = n2x + 1;
 			float x = t.vTriCoords[j].x;
 			float y = t.vTriCoords[j].y;
-			//printf("---> x y %f %f \n", x, y);
-			
-			// DEBUG
-			//ofVec2f v0( (float)gUTest[n0x], (float)gUTest[n0y] );
-//			ofVec2f v1( (float)gUTest[n1x], (float)gUTest[n1y] );
-//			ofVec2f v2( (float)gUTest[n2x], (float)gUTest[n2y] );
-//			ofVec2f v01( v1 - v0 );
-//			ofVec2f v01Perp( v01.y, -v01.x);
-//			ofVec2f vTest( v0 + x * v01 + y * v01Perp );
-//			float fDist = (vTest - v2).Dot(vTest - v2);
-			//if ( fDist > 0.0001f )
-			//	DebugBreak();
-			//DEBUG
-			
-			//double dTest = 
-			//(1 - 2*x + (x*x) + (y*y))*pow(gUTest[n0x],2) + (1 - 2*x + (x*x) + (y*y))*pow(gUTest[n0y],2) + 
-			//	((x*x) + (y*y))*pow(gUTest[n1x],2) + ((x*x) + (y*y))*pow(gUTest[n1y],2) + 
-			//	pow(gUTest[n2x],2) + pow(gUTest[n2y],2) + gUTest[n1y]*(-2*y*gUTest[n2x] - 2*x*gUTest[n2y]) + 
-			//	gUTest[n0y]*(-2*y*gUTest[n1x] + (2*x - 2*(x*x) - 2*(y*y))*gUTest[n1y] + 2*y*gUTest[n2x] + 
-			//	(-2 + 2*x)*gUTest[n2y]) + gUTest[n0x]*
-			//	((2*x - 2*(x*x) - 2*(y*y))*gUTest[n1x] + 2*y*gUTest[n1y] + (-2 + 2*x)*gUTest[n2x] - 
-			//	2*y*gUTest[n2y]) + gUTest[n1x]*(-2*x*gUTest[n2x] + 2*y*gUTest[n2y]);
-			//_RMSInfo("TEST IS %f %f\n", dTest, fDist);
+
+            float xx  = x*x;
+            float yy  = y*y;
+            float x2  = 2*x;
+            float y2  = 2*y;
+            float xx2 = 2*xx;
+            float yy2 = 2*yy;
 			
 			// n0x,n?? elems
-			m_mFirstMatrix[n0x][n0x] += 1 - 2*x + x*x + y*y;
-			m_mFirstMatrix[n0x][n1x] += 2*x - 2*x*x - 2*y*y;		//m_mFirstMatrix[n1x][n0x] += 2*x - 2*x*x - 2*y*y;
-			m_mFirstMatrix[n0x][n1y] += 2*y;						//m_mFirstMatrix[n1y][n0x] += 2*y;
-			m_mFirstMatrix[n0x][n2x] += -2 + 2*x;					//m_mFirstMatrix[n2x][n0x] += -2 + 2*x;
-			m_mFirstMatrix[n0x][n2y] += -2 * y;						//m_mFirstMatrix[n2y][n0x] += -2 * y;
+			m_mFirstMatrix[n0x][n0x] += 1 - x2 + xx + yy;
+			m_mFirstMatrix[n0x][n1x] += x2 - xx2 - yy2;
+			m_mFirstMatrix[n0x][n1y] += y2;
+			m_mFirstMatrix[n0x][n2x] += -2 + x2;
+			m_mFirstMatrix[n0x][n2y] += -2 * y;
 			
-			fTriErr += (1 - 2*x + x*x + y*y)  * gUTest[n0x] * gUTest[n0x];
-			fTriErr += (2*x - 2*x*x - 2*y*y)  * gUTest[n0x] * gUTest[n1x];
-			fTriErr += (2*y)                  * gUTest[n0x] * gUTest[n1y];
-			fTriErr += (-2 + 2*x )            * gUTest[n0x] * gUTest[n2x];
-			fTriErr += (-2 * y)               * gUTest[n0x] * gUTest[n2y];
+			fTriErr += (1 - x2 + xx + yy)  * gUTest[n0x] * gUTest[n0x];
+			fTriErr += (x2 - xx2 - yy2)    * gUTest[n0x] * gUTest[n1x];
+			fTriErr += (y2)                * gUTest[n0x] * gUTest[n1y];
+			fTriErr += (-2 + x2 )          * gUTest[n0x] * gUTest[n2x];
+			fTriErr += (-2 * y)            * gUTest[n0x] * gUTest[n2y];
 			
 			// n0y,n?? elems
-			m_mFirstMatrix[n0y][n0y] += 1 - 2*x + x*x + y*y;
-			m_mFirstMatrix[n0y][n1x] += -2*y;						//m_mFirstMatrix[n1x][n0y] += -2*y;
-			m_mFirstMatrix[n0y][n1y] += 2*x - 2*x*x - 2*y*y;		//m_mFirstMatrix[n1y][n0y] += 2*x - 2*x*x - 2*y*y;
-			m_mFirstMatrix[n0y][n2x] += 2*y;						//m_mFirstMatrix[n2x][n0y] += 2*y;
-			m_mFirstMatrix[n0y][n2y] += -2 + 2*x;					//m_mFirstMatrix[n2y][n0y] += -2 + 2*x;
+			m_mFirstMatrix[n0y][n0y] += 1 - x2 + xx + yy;
+			m_mFirstMatrix[n0y][n1x] += -y2;
+			m_mFirstMatrix[n0y][n1y] += x2 - xx2 - yy2;
+			m_mFirstMatrix[n0y][n2x] += y2;
+			m_mFirstMatrix[n0y][n2y] += -2 + x2;
 			
-			fTriErr += (1 - 2*x + x*x + y*y)   * gUTest[n0y] * gUTest[n0y];
-			fTriErr += (-2*y)                  * gUTest[n0y] * gUTest[n1x];
-			fTriErr += (2*x - 2*x*x - 2*y*y)   * gUTest[n0y] * gUTest[n1y];
-			fTriErr += (2*y)                   * gUTest[n0y] * gUTest[n2x];
-			fTriErr += (-2 + 2*x)              * gUTest[n0y] * gUTest[n2y];
+			fTriErr += (1 - x2 + xx + yy)   * gUTest[n0y] * gUTest[n0y];
+			fTriErr += (-y2)                * gUTest[n0y] * gUTest[n1x];
+			fTriErr += (x2 - xx2 - yy2)     * gUTest[n0y] * gUTest[n1y];
+			fTriErr += (y2)                 * gUTest[n0y] * gUTest[n2x];
+			fTriErr += (-2 + x2)            * gUTest[n0y] * gUTest[n2y];
 			
 			// n1x,n?? elems
-			m_mFirstMatrix[n1x][n1x] += x*x + y*y;
-			m_mFirstMatrix[n1x][n2x] += -2*x;						//m_mFirstMatrix[n2x][n1x] += -2*x;
-			m_mFirstMatrix[n1x][n2y] += 2*y;						//m_mFirstMatrix[n2y][n1x] += 2*y;
+			m_mFirstMatrix[n1x][n1x] += xx + yy;
+			m_mFirstMatrix[n1x][n2x] += -x2;
+			m_mFirstMatrix[n1x][n2y] +=  y2;
 			
-			fTriErr += (x*x + y*y)            * gUTest[n1x] * gUTest[n1x];
-			fTriErr += (-2*x)                 * gUTest[n1x] * gUTest[n2x];
-			fTriErr += (2*y)                  * gUTest[n1x] * gUTest[n2y];
+			fTriErr += (xx + yy)            * gUTest[n1x] * gUTest[n1x];
+			fTriErr += (-x2)                * gUTest[n1x] * gUTest[n2x];
+			fTriErr += ( y2)                * gUTest[n1x] * gUTest[n2y];
 			
 			//n1y,n?? elems
-			m_mFirstMatrix[n1y][n1y] += x*x + y*y;
-			m_mFirstMatrix[n1y][n2x] += -2*y;						//m_mFirstMatrix[n2x][n1y] += -2*y;
-			m_mFirstMatrix[n1y][n2y] += -2*x;						//m_mFirstMatrix[n2y][n1y] += -2*x;
+			m_mFirstMatrix[n1y][n1y] += xx + yy;
+			m_mFirstMatrix[n1y][n2x] += -y2;
+			m_mFirstMatrix[n1y][n2y] += -x2;
 			
 			
-			fTriErr += (x*x + y*y)            * gUTest[n1y] * gUTest[n1y];
-			fTriErr += (-2*y)                 * gUTest[n1y] * gUTest[n2x];
-			fTriErr += (-2*x)                 * gUTest[n1y] * gUTest[n2y];
+			fTriErr += (xx + yy)            * gUTest[n1y] * gUTest[n1y];
+			fTriErr += (-y2)                * gUTest[n1y] * gUTest[n2x];
+			fTriErr += (-x2)                * gUTest[n1y] * gUTest[n2y];
 			
 			// final 2 elems
 			m_mFirstMatrix[n2x][n2x] += 1;
@@ -715,67 +996,67 @@ void RigidMeshDeformer2D::PrecomputeOrientationMatrix()
 			//_RMSInfo("  Error for vert %d (%d) - %f\n", j, t.nVerts[j], fTriErr);
 			fTriSumErr += fTriErr;
 		}
+        
 		//_RMSInfo("  Total Error: %f\n", fTriSumErr);
 	}
-	
-	
+
+    t_end = ofGetElapsedTimeMicros();
+    cout << " Orientation Computations (3) " << (t_end - t_mid) << endl;
+    t_mid = t_end;
+    
 	// test...
+    /* Bryce Note: We should not be wasting time testing inside of our code.
 	Wml::GVectord gUTemp = m_mFirstMatrix * gUTest;
 	double fSum = gUTemp.Dot( gUTest );
-	//printf("    (test) Residual is %f\n", fSum);
-	
-	//std::exit(0);
-	
-	// // just try printing out matrix...
-//	 for ( unsigned int i = 0; i < 2*nFreeVerts; ++i ) {
-//	 for ( unsigned int j = 0 ; j < 2*nFreeVerts; ++j )
-//	 printf("%5.2f ", m_mFirstMatrix(i,j));
-//	 printf("| ");
-//	 for ( unsigned int j = 0; j < 2*nConstraints; ++j )
-//	 printf("%5.2f ", m_mFirstMatrix(i, 2*nFreeVerts+j));
-//	 printf("\n");
-//	 }
-//	 printf("-------\n");
-//	 for ( unsigned int i = 0; i < 2*nConstraints; ++i ) {
-//	 for ( unsigned int j = 0 ; j < 2*nFreeVerts; ++j )
-//	 printf("%5.2f ", m_mFirstMatrix(i+2*nFreeVerts,j));
-//	 printf("| ");
-//	 for ( unsigned int j = 0; j < 2*nConstraints; ++j )
-//	 printf("%5.2f ", m_mFirstMatrix(i+2*nFreeVerts, 2*nFreeVerts+j));
-//	 printf("\n");
-//	 }
-//	 printf("\n\n");
-	 
-	
+	printf("    (test) Residual is %f\n", fSum);
+     */
+    
 	// extract G00 matrix
 	Wml::GMatrixd mG00( 2*nFreeVerts, 2*nFreeVerts );
 	ExtractSubMatrix( m_mFirstMatrix, 0, 0, mG00 );
-	
+
+    t_end = ofGetElapsedTimeMicros();
+    cout << " Orientation Computations (4) " << (t_end - t_mid) << endl;
+    t_mid = t_end;
+    
 	// extract G01 and G10 matrices
 	Wml::GMatrixd mG01( 2 * (int)nFreeVerts, 2 * (int)nConstraints );
 	ExtractSubMatrix( m_mFirstMatrix, 0, 2*nFreeVerts, mG01 );
 	Wml::GMatrixd mG10( 2 * (int)nConstraints, 2 * (int)nFreeVerts );
 	ExtractSubMatrix( m_mFirstMatrix, 2*nFreeVerts, 0, mG10 );
 	
-	// ok, now compute GPrime = G00 + Transpose(G00) and B = G01 + Transpose(G10)
+    t_end = ofGetElapsedTimeMicros();
+    cout << " Orientation Computations (5) " << (t_end - t_mid) << endl;
+    t_mid = t_end;
+    
+    // ok, now compute GPrime = G00 + Transpose(G00) and B = G01 + Transpose(G10)
+    // Bryce Note : Performing an algorithmically optimized version of this operation is slow in practice.
+    // Keeping the original naive arithmetic.
+    //addToTranspose(mG00);
 	Wml::GMatrixd mGPrime = mG00 + mG00.Transpose();
-	Wml::GMatrixd mB = mG01 + mG10.Transpose();
-	
+	Wml::GMatrixd mB      = mG01 + mG10.Transpose();
+
+    t_end = ofGetElapsedTimeMicros();
+    cout << " Orientation Computations (Transposition) " << (t_end - t_mid) << endl;
+    t_mid = t_end;
+    
 	// ok, now invert GPrime
 	Wml::GMatrixd mGPrimeInverse( mGPrime.GetRows(), mGPrime.GetColumns() );
-	
-	/*
-	 bool bInverted = Wml::LinearSystemd::Inverse( mGPrime, mGPrimeInverse );
-	if (!bInverted)
-		DebugBreak();
-	*/
-	invert(mGPrime, mGPrimeInverse);
-	
+    
+	invert (mGPrime, mGPrimeInverse);
+
+    t_end = ofGetElapsedTimeMicros();
+    cout << " Orientation Computations (Inversion) " << (t_end - t_mid) << endl;
+    t_mid = t_end;
+    
 	// now compute -GPrimeInverse * B
 	Wml::GMatrixd mFinal = mGPrimeInverse * mB;
 	mFinal *= -1;
 	
 	m_mFirstMatrix = mFinal;		// [RMS: not efficient!]
+
+    
+    cout << " Orientation Computations (ALL) " << (t_end - t_start) << endl;
 }
 
 static RigidMeshDeformer2D::Triangle * g_pCurTriangle = NULL;
@@ -797,9 +1078,6 @@ void AccumScaleEntry( Wml::GMatrixd & mF, int nRow, int nCol, double fAccum )
 }
 
 
-
-
-
 void RigidMeshDeformer2D::PrecomputeScalingMatrices( unsigned int nTriangle )
 {
 	// ok now fill matrix
@@ -817,45 +1095,45 @@ void RigidMeshDeformer2D::PrecomputeScalingMatrices( unsigned int nTriangle )
 	double x20 = t.vTriCoords[2].x;
 	double y20 = t.vTriCoords[2].y;
 	
-	double k1 = x12*y01 + (-1 + x01)*y12;
-	double k2 = -x12 + x01*x12 - y01*y12;
-	double k3 = -y01 + x20*y01 + x01*y20;
-	double k4 = -y01 + x01*y01 + x01*y20;
+	double k1 =  x12*y01 + (-1 + x01)*y12 ;
+	double k2 = -x12 + x01*x12 - y01*y12 ;
+	double k3 = -y01 + x20*y01 + x01*y20 ;
+	double k4 = -y01 + x01*y01 + x01*y20 ;
 	double k5 = -x01 + x01*x20 - y01*y20 ;
 	
 	double a = -1 + x01;
-	double a1 = pow(-1 + x01,2) + pow(y01,2);
-	double a2 = pow(x01,2) + pow(y01,2);
+	double a1 = sqd(-1 + x01) + sqd(y01);
+	double a2 = sqd(x01)      + sqd(y01);
 	double b =  -1 + x20;
-	double b1 = pow(-1 + x20,2) + pow(y20,2);
-	double c2 = pow(x12,2) + pow(y12,2);
+	double b1 = sqd(-1 + x20) + sqd(y20);
+	double c2 = sqd(x12)      + sqd(y12);
 	
-	double r1 = 1 + 2*a*x12 + a1*pow(x12,2) - 2*y01*y12 + a1*pow(y12,2);
-	double r2 = -(b*x01) - b1*pow(x01,2) + y01*(-(b1*y01) + y20);
-	double r3 = -(a*x12) - a1*pow(x12,2) + y12*(y01 - a1*y12);
-	double r5 = a*x01 + pow(y01,2);
+	double r1 = 1 + 2*a*x12 + a1*sqd(x12) - 2*y01*y12 + a1*sqd(y12);
+	double r2 = -(b*x01) - b1*sqd(x01) + y01*(-(b1*y01) + y20);
+	double r3 = -(a*x12) - a1*sqd(x12) + y12*(y01 - a1*y12);
+	double r5 =   a*x01  + sqd(y01);
 	double r6 = -(b*y01) - x01*y20;
-	double r7 = 1 + 2*b*x01 + b1*pow(x01,2) + b1*pow(y01,2) - 2*y01*y20;
+	double r7 = 1 + 2*b*x01 + b1*sqd(x01) + b1*sqd(y01) - 2*y01*y20;
 	
 	//  set up F matrix
 	
 	// row 0 mF
-	t.mF[0][0] = 2*a1 + 2*a1*c2 + 2*r7;
-	t.mF[0][1] = 0;
-	t.mF[0][2] = 2*r2 + 2*r3 - 2*r5;
-	t.mF[0][3] = 2*k1 + 2*r6 + 2*y01;
+	t.mF[0][0] =  2*a1 + 2*a1*c2 + 2*r7;
+	t.mF[0][1] =  0;
+	t.mF[0][2] =  2*r2 + 2*r3 - 2*r5;
+	t.mF[0][3] =  2*k1 + 2*r6 + 2*y01;
 	
 	// row 1
-	t.mF[1][0] = 0;
-	t.mF[1][1] = 2*a1 + 2*a1*c2 + 2*r7;
+	t.mF[1][0] =  0;
+	t.mF[1][1] =  2*a1 + 2*a1*c2 + 2*r7;
 	t.mF[1][2] = -2*k1 + 2*k3 - 2*y01;
-	t.mF[1][3] = 2*r2 + 2*r3 - 2*r5;
+	t.mF[1][3] =  2*r2 + 2*r3 - 2*r5;
 	
 	// row 2
-	t.mF[2][0] = 2*r2 + 2*r3 - 2*r5;
+	t.mF[2][0] =  2*r2 + 2*r3 - 2*r5;
 	t.mF[2][1] = -2*k1 + 2*k3 - 2*y01;
-	t.mF[2][2] = 2*a2 + 2*a2*b1 + 2*r1;
-	t.mF[2][3] = 0;
+	t.mF[2][2] =  2*a2 + 2*a2*b1 + 2*r1;
+	t.mF[2][3] =  0;
 	
 	//row 3
 	t.mF[3][0] = 2*k1 - 2*k3 + 2*y01;
@@ -865,8 +1143,9 @@ void RigidMeshDeformer2D::PrecomputeScalingMatrices( unsigned int nTriangle )
 	
 	// ok, now invert F
 	Wml::GMatrixd mFInverse(4,4);
-	bool bResult = Wml::LinearSystemd::Inverse(t.mF, mFInverse);
-	
+    bool bResult = true;
+    invert(t.mF, mFInverse);
+    
     mFInverse *= -1.0;
 	if (!bResult) {
 		Debugbreak();
@@ -876,46 +1155,44 @@ void RigidMeshDeformer2D::PrecomputeScalingMatrices( unsigned int nTriangle )
 	// set up C matrix
 	
 	// row 0 mC
-	t.mC[0][0] = 2*k2;
+	t.mC[0][0] =  2*k2;
 	t.mC[0][1] = -2*k1;
-	t.mC[0][2] = 2*(-1-k5);
-	t.mC[0][3] = 2*k3;
-	t.mC[0][4] = 2*a;
+	t.mC[0][2] =  2*(-1-k5);
+	t.mC[0][3] =  2*k3;
+	t.mC[0][4] =  2*a;
 	t.mC[0][5] = -2*y01;
 	
 	// row 1 mC
-	t.mC[1][0] = 2*k1;
-	t.mC[1][1] = 2*k2;
+	t.mC[1][0] =  2*k1;
+	t.mC[1][1] =  2*k2;
 	t.mC[1][2] = -2*k3;
-	t.mC[1][3] = 2*(-1-k5);
-	t.mC[1][4] = 2*y01;
-	t.mC[1][5] = 2*a;
+	t.mC[1][3] =  2*(-1-k5);
+	t.mC[1][4] =  2*y01;
+	t.mC[1][5] =  2*a;
 	
 	// row 2 mC
-	t.mC[2][0] = 2*(-1-k2);
-	t.mC[2][1] = 2*k1;
-	t.mC[2][2] = 2*k5;
-	t.mC[2][3] = 2*r6;
+	t.mC[2][0] =  2*(-1-k2);
+	t.mC[2][1] =  2*k1;
+	t.mC[2][2] =  2*k5;
+	t.mC[2][3] =  2*r6;
 	t.mC[2][4] = -2*x01;
-	t.mC[2][5] = 2*y01;
+	t.mC[2][5] =  2*y01;
 	
 	// row 3 mC
-	t.mC[3][0] = 2*k1;
-	t.mC[3][1] = 2*(-1-k2);
+	t.mC[3][0] =  2*k1;
+	t.mC[3][1] =  2*(-1-k2);
 	t.mC[3][2] = -2*k3;
-	t.mC[3][3] = 2*k5;
+	t.mC[3][3] =  2*k5;
 	t.mC[3][4] = -2*y01;
 	t.mC[3][5] = -2*x01;
-	
-	
 }
 
 
 
 
-void Scale( ofVec2f & vTriV0,
+void Scale(     ofVec2f & vTriV0,
                 ofVec2f & vTriV1,
-               ofVec2f & vTriV2,
+                ofVec2f & vTriV2,
                 float fScale )
 {
     // find center of mass
@@ -1010,10 +1287,9 @@ void RigidMeshDeformer2D::ValidateDeformedMesh( bool bRigid )
 	if ( bRigid ) {
 		// ok, now scale triangles
 		size_t nTris = m_vTriangles.size();
-		for ( unsigned int i = 0; i < nTris; ++i )
+		for ( unsigned int i = 0; i < nTris; ++i ){
 			UpdateScaledTriangle(i);
-		
-		
+		}
 		ApplyFittingStep();
 	}
 }

@@ -5,6 +5,7 @@
 ofxPuppet::ofxPuppet()
 :needsUpdating(false)
 ,nSelected(0) {
+
 }
 
 void ofxPuppet::setup(ofMesh & mesh){
@@ -62,7 +63,7 @@ void ofxPuppet::setControlPoint(int i, const ofVec2f& position) {
 void ofxPuppet::removeControlPoint(int i) {
 	controlPoints.erase(i);
 	deformer.RemoveHandle(i);
-	needsUpdating = true; 
+	needsUpdating = true;
 }
 
 ofMesh& ofxPuppet::getOriginalMesh() {
@@ -72,3 +73,4 @@ ofMesh& ofxPuppet::getOriginalMesh() {
 ofMesh& ofxPuppet::getDeformedMesh() {
 	return deformedMesh;
 }
+
